@@ -1,64 +1,79 @@
-"""High-level pipeline monitor that ties metrics, alerts, and notifications."""
+"""Pipeline monitor: collects metrics and evaluates alert rules."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pipewatch.alerts import Alert, AlertRule
+from pipewatch.filter import MetricFilter, apply_filter
 from pipewatch.metrics import MetricsCollector, PipelineMetric
-from pipewatch.notifier import NotificationDispatcher, StdoutNotifier
 
 
-@dataclass
 class PipelineMonitor:
-    """Orchestrates metric collection, alert evaluation, and notifications."""
+    """Central object that ties together metric collection and alerting."""
 
-    name: str
-    rules: List[AlertRule] = field(default_factory=list)
-    dispatcher: NotificationDispatcher = field(
-        default_factory=lambda: NotificationDispatcher(channels=[StdoutNotifier()])
-    )
-    _collector: MetricsCollector = field(
-        default_factory=MetricsCollector, repr=False
-    )
+    def __init__(self, pipeline_name: str) -> None:
+        self.pipeline_name = pipeline_name
+        self._collector: MetricsCollector = MetricsCollector()
+        self._rules: List[AlertRule] = []
+        self._alerts: List[Alert] = []
+
+    # ------------------------------------------------------------------
+    # Rule management
+    # ------------------------------------------------------------------
 
     def add_rule(self, rule: AlertRule) -> None:
-        """Register an alert rule for this pipeline."""
-        self.rules.append(rule)
+        """Register an *AlertRule* to be evaluated on each recorded metric."""
+        self._rules.append(rule)
 
-    def record(self, metric: PipelineMetric) -> List[Alert]:
-        """Record a metric, evaluate all rules, dispatch any alerts.
+    # ------------------------------------------------------------------
+    # Metric recording
+    # ------------------------------------------------------------------
 
-        Returns the list of alerts that were triggered.
-        """
+    def record(self, name: str, value: float, tags: Optional[Dict] = None) -> PipelineMetric:
+        """Record a single metric and evaluate all registered rules."""
+        metric = PipelineMetric(
+            pipeline_name=self.pipeline_name,
+            name=name,
+            value=value,
+            tags=tags or {},
+        )
         self._collector.add(metric)
-        triggered: List[Alert] = []
-        for rule in self.rules:
-            alert: Optional[Alert] = rule.evaluate(metric)
+        self._evaluate_rules(metric)
+        return metric
+
+    def record_many(self, entries: List[Dict]) -> List[PipelineMetric]:
+        """Record multiple metrics from a list of dicts with keys name/value/tags."""
+        return [self.record(**entry) for entry in entries]
+
+    # ------------------------------------------------------------------
+    # Filtering
+    # ------------------------------------------------------------------
+
+    def query(self, metric_filter: MetricFilter) -> List[PipelineMetric]:
+        """Return metrics that satisfy *metric_filter*."""
+        return apply_filter(self._collector.metrics, metric_filter)
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _evaluate_rules(self, metric: PipelineMetric) -> None:
+        for rule in self._rules:
+            alert = rule.evaluate(metric)
             if alert is not None:
-                alert.pipeline_name = self.name
-                triggered.append(alert)
-        if triggered:
-            self.dispatcher.dispatch_all(triggered)
-        return triggered
+                self._alerts.append(alert)
 
-    def record_many(self, metrics: List[PipelineMetric]) -> List[Alert]:
-        """Record multiple metrics and return all triggered alerts."""
-        all_alerts: List[Alert] = []
-        for metric in metrics:
-            all_alerts.extend(self.record(metric))
-        return all_alerts
+    # ------------------------------------------------------------------
+    # Reporting
+    # ------------------------------------------------------------------
 
-    def summary(self) -> dict:
-        """Return a summary dict of the current collector state."""
+    def summary(self) -> Dict:
+        """Return a high-level summary dict for the monitored pipeline."""
+        metrics = self._collector.metrics
         return {
-            "pipeline": self.name,
-            "metrics_count": len(self._collector.metrics),
-            "rules_count": len(self.rules),
-            "latest": (
-                self._collector.metrics[-1].to_dict()
-                if self._collector.metrics
-                else None
-            ),
+            "pipeline": self.pipeline_name,
+            "total_metrics": len(metrics),
+            "total_alerts": len(self._alerts),
+            "alerts": [a.to_dict() for a in self._alerts],
         }
